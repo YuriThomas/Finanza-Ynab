@@ -1,5 +1,10 @@
 import React from 'react';
+import { createClient } from '@supabase/supabase-js';
 import './index.css';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Adds a hover style on top of a base style object without needing React state:
 // applies `hover` styles directly to the DOM node on mouseenter and restores `base` on mouseleave.
@@ -11,13 +16,9 @@ function hoverStyle(base, hover) {
   };
 }
 
-// ---- Cifratura dei dati salvati (Web Crypto: PBKDF2 + AES-GCM) ----
-// I dati non vengono mai scritti in chiaro nel localStorage: la chiave di
-// cifratura è derivata dalla password inserita al login. Chi non conosce la
-// password non può leggere i dati anche accedendo direttamente al
-// localStorage del browser. Nota: la password stessa resta comunque nel
-// codice sorgente dell'app (è un'app statica, senza server), quindi questo
-// protegge da chi guarda solo i dati salvati, non da chi legge il codice.
+// ---- Supabase cloud storage ----
+// I dati dell'app vengono salvati in Supabase nella tabella user_finance_store.
+// Ogni utente autenticato legge e aggiorna solo il proprio record grazie alle policy RLS.
 function bytesToB64(bytes) {
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
@@ -64,7 +65,7 @@ class App extends React.Component {
     const isMobile = (typeof window !== 'undefined') ? window.innerWidth < 860 : false;
     const rememberedUser = (typeof window !== 'undefined') ? (localStorage.getItem('fp_remember_user') || '') : '';
     this.store = null;
-    this._cryptoKey = null;
+    this._supabaseUser = null;
     this.state = {
       view: startView,
       month: '2026-07',
@@ -107,18 +108,24 @@ class App extends React.Component {
   /* ---------- ABSTRACT DATA STORE (Sheets-like tables, swappable) ---------- */
   createStoreFromDb(db){
     const self = this;
-    const ENC_KEY = 'fp_mvp_store_v5_enc';
     let saveChain = Promise.resolve();
     const save = () => {
-      // db is mutated synchronously above before save() is called, so by the
-      // time this queued step actually runs it always encrypts the latest
-      // state; chaining (rather than firing in parallel) keeps writes to
-      // localStorage in the right order even if several saves happen in a
-      // quick burst.
+      // db is mutated synchronously before save() is called. Chaining keeps
+      // writes ordered when several saves happen in quick succession.
+      const snapshot = JSON.parse(JSON.stringify(db));
       saveChain = saveChain
-        .then(() => encryptJSON(self._cryptoKey, db))
-        .then((payload) => { try { localStorage.setItem(ENC_KEY, payload); } catch(e){} })
-        .catch((e) => { console.error('Salvataggio cifrato non riuscito:', e); });
+        .then(async () => {
+          if (!self._supabaseUser) return;
+          const { error } = await supabase
+            .from('user_finance_store')
+            .upsert({
+              user_id: self._supabaseUser.id,
+              data: snapshot,
+              updated_at: new Date().toISOString(),
+            }, { onConflict: 'user_id' });
+          if (error) throw error;
+        })
+        .catch((e) => { console.error('Salvataggio cloud non riuscito:', e); });
     };
     save();
     const uid = (p) => p + '_' + Math.random().toString(36).slice(2,9);
@@ -138,32 +145,23 @@ class App extends React.Component {
     return api;
   }
 
-  // Deriva la chiave dalla password inserita e decifra (o inizializza) i dati.
-  // Va chiamato solo dopo che utente/password sono stati verificati.
-  async loadOrInitStore(password){
-    const SALT_KEY = 'fp_mvp_salt_v1';
-    const ENC_KEY = 'fp_mvp_store_v5_enc';
-    const OLD_PLAIN_KEY = 'fp_mvp_store_v5'; // versione pre-cifratura, da migrare una tantum
-    let salt = localStorage.getItem(SALT_KEY);
-    if (!salt) { salt = randomB64(16); localStorage.setItem(SALT_KEY, salt); }
-    const key = await deriveKey(password, salt);
-    let db;
-    const existingEnc = localStorage.getItem(ENC_KEY);
-    if (existingEnc) {
-      try {
-        db = await decryptJSON(key, existingEnc);
-      } catch(e) {
-        console.error('Impossibile decifrare i dati salvati su questo browser; ripristino i dati di esempio.', e);
-        db = this.seed();
-      }
-    } else {
-      let migrated = null;
-      try { const old = localStorage.getItem(OLD_PLAIN_KEY); if (old) migrated = JSON.parse(old); } catch(e){}
-      db = migrated || this.seed();
-    }
-    this._cryptoKey = key;
+  // Carica dal cloud i dati dell'utente autenticato oppure inizializza i dati demo.
+  async loadOrInitStore(){
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+    if (userError || !userData.user) throw userError || new Error('Utente non autenticato');
+    this._supabaseUser = userData.user;
+
+    const { data: row, error } = await supabase
+      .from('user_finance_store')
+      .select('data')
+      .eq('user_id', userData.user.id)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const db = row && row.data ? row.data : this.seed();
+
     this.store = this.createStoreFromDb(db);
-    try { localStorage.removeItem(OLD_PLAIN_KEY); } catch(e){}
     return db;
   }
 
@@ -250,32 +248,42 @@ class App extends React.Component {
   onAuthUsername(e){ this.setState({ auth: Object.assign({}, this.state.auth, { username:e.target.value, error:'' }) }); }
   onAuthPassword(e){ this.setState({ auth: Object.assign({}, this.state.auth, { password:e.target.value, error:'' }) }); }
   onAuthRemember(e){ this.setState({ auth: Object.assign({}, this.state.auth, { remember:e.target.checked }) }); }
-  submitLogin(e){
+  async submitLogin(e){
     if(e && e.preventDefault) e.preventDefault();
     const { username, password, remember } = this.state.auth;
-    if(username!=='Thomas' || password!=='admin0796'){
-      this.setState({ auth: Object.assign({}, this.state.auth, { error:'Utente o password non corretti.' }) });
+    const email = String(username || '').trim();
+    if(!email || !password){
+      this.setState({ auth: Object.assign({}, this.state.auth, { error:'Inserisci email e password.' }) });
       return;
     }
+    this.setState({ auth: Object.assign({}, this.state.auth, { busy:true, error:'' }) });
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if(error){
+      this.setState({ auth: Object.assign({}, this.state.auth, { busy:false, error:'Login non riuscito: ' + error.message }) });
+      return;
+    }
+
     if(typeof window!=='undefined'){
-      if(remember) localStorage.setItem('fp_remember_user', username);
+      if(remember) localStorage.setItem('fp_remember_user', email);
       else localStorage.removeItem('fp_remember_user');
     }
-    this.setState({ auth: Object.assign({}, this.state.auth, { busy:true, error:'' }) });
-    this.loadOrInitStore(password).then((db) => {
+
+    try {
+      const db = await this.loadOrInitStore();
       this.setState({
         auth: Object.assign({}, this.state.auth, { loggedIn:true, password:'', busy:false, error:'' }),
         accounts: db.Accounts || [], transactions: db.Transactions || [], categories: db.Categories || [],
         groups: db.Groups || [], budgets: db.Budgets || [],
       });
-    }).catch((err) => {
-      console.error('Sblocco dati non riuscito:', err);
-      this.setState({ auth: Object.assign({}, this.state.auth, { busy:false, error:'Impossibile sbloccare i dati su questo browser.' }) });
-    });
+    } catch (err) {
+      console.error('Caricamento cloud non riuscito:', err);
+      this.setState({ auth: Object.assign({}, this.state.auth, { busy:false, error:'Accesso riuscito, ma caricamento dati cloud non riuscito.' }) });
+    }
   }
   logout(){
     this.store = null;
-    this._cryptoKey = null;
+    this._supabaseUser = null;
     this.setState({
       auth: Object.assign({}, this.state.auth, { loggedIn:false, password:'', error:'' }),
       accounts: [], transactions: [], categories: [], groups: [], budgets: [],
@@ -936,12 +944,12 @@ class App extends React.Component {
             </div>
             <div style={{lineHeight:'1.15'}}>
               <div style={{fontWeight:'700', fontSize:'16px', letterSpacing:'-0.2px'}}>Finanza Personale</div>
-              <div style={{fontSize:'12px', color:'#6b7079'}}>Accedi per continuare</div>
+              <div style={{fontSize:'12px', color:'#6b7079'}}>Accedi al cloud</div>
             </div>
           </div>
           <label style={{display:'flex', flexDirection:'column', gap:'6px', fontSize:'12px', color:'#9297a1', fontWeight:'600', marginBottom:'14px'}}>
-            Utente
-            <input type="text" autoCapitalize="none" autoCorrect="off" value={username} onChange={(e)=>this.onAuthUsername(e)} style={{padding:'10px 12px', background:'#0c0d10', border:'1px solid #23262d', borderRadius:'9px', color:'#e7e9ee', fontSize:'14px'}} />
+            Email
+            <input type="email" autoCapitalize="none" autoCorrect="off" value={username} onChange={(e)=>this.onAuthUsername(e)} style={{padding:'10px 12px', background:'#0c0d10', border:'1px solid #23262d', borderRadius:'9px', color:'#e7e9ee', fontSize:'14px'}} />
           </label>
           <label style={{display:'flex', flexDirection:'column', gap:'6px', fontSize:'12px', color:'#9297a1', fontWeight:'600', marginBottom:'6px'}}>
             Password
@@ -952,8 +960,8 @@ class App extends React.Component {
             Ricorda il nome utente su questo dispositivo
           </label>
           {error ? (<div style={{marginTop:'10px', padding:'9px 12px', background:'rgba(240,97,109,0.1)', border:'1px solid rgba(240,97,109,0.3)', borderRadius:'9px', color:'#f0616d', fontSize:'12.5px', fontWeight:'600'}}>{error}</div>) : null}
-          <button type="submit" disabled={busy} style={{width:'100%', marginTop:'18px', padding:'11px', background: busy ? '#3d6fd6' : '#5b8def', border:'none', borderRadius:'9px', color:'#fff', fontSize:'14px', fontWeight:'700', cursor: busy ? 'default' : 'pointer'}}>{busy ? 'Sblocco in corso…' : 'Accedi'}</button>
-          <p style={{margin:'16px 0 0', fontSize:'11px', color:'#5a5f68', lineHeight:'1.5'}}>I dati sono cifrati sul dispositivo con una chiave derivata dalla password. Questa schermata scoraggia l'accesso occasionale, ma non sostituisce una vera autenticazione lato server.</p>
+          <button type="submit" disabled={busy} style={{width:'100%', marginTop:'18px', padding:'11px', background: busy ? '#3d6fd6' : '#5b8def', border:'none', borderRadius:'9px', color:'#fff', fontSize:'14px', fontWeight:'700', cursor: busy ? 'default' : 'pointer'}}>{busy ? 'Accesso in corso…' : 'Accedi'}</button>
+          <p style={{margin:'16px 0 0', fontSize:'11px', color:'#5a5f68', lineHeight:'1.5'}}>I dati sono salvati nel tuo account Supabase e sincronizzati tra i dispositivi dopo il login.</p>
         </form>
       </div>
     );
