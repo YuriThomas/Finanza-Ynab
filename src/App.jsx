@@ -94,15 +94,28 @@ class App extends React.Component {
     this.measureBudgetSticky();
   }
   measureBudgetSticky(){
-    if (this.state.view === 'budget' && this.budgetStickyRef.current){
-      const h = this.budgetStickyRef.current.offsetHeight;
+    const el = this.budgetStickyRef.current;
+    if (this.state.view === 'budget' && el){
+      const h = el.offsetHeight;
       if (h && h !== this.state.budgetStickyH) this.setState({ budgetStickyH: h });
+      // Un ResizeObserver (non solo una misura una tantum) è necessario perché questo
+      // blocco può cambiare altezza per motivi che non passano da componentDidUpdate:
+      // in particolare il caricamento asincrono dei font web (Hanken Grotesk/JetBrains
+      // Mono) causa un reflow del testo DOPO la prima misura, disallineando per sempre
+      // le intestazioni agganciate sotto se non la si rileva e corregge.
+      if (typeof ResizeObserver !== 'undefined' && this._budgetStickyRO_target !== el){
+        if (this._budgetStickyRO) this._budgetStickyRO.disconnect();
+        this._budgetStickyRO = new ResizeObserver(() => this.measureBudgetSticky());
+        this._budgetStickyRO.observe(el);
+        this._budgetStickyRO_target = el;
+      }
     }
   }
   componentWillUnmount(){
     window.removeEventListener('resize', this._onResize);
     window.removeEventListener('focusin', this._onBudgetFocus);
     window.removeEventListener('keydown', this._onKey);
+    if (this._budgetStickyRO) this._budgetStickyRO.disconnect();
   }
   componentDidUpdate(){
     // Misura l'altezza reale del blocco sticky "mese + pronto da assegnare" del
