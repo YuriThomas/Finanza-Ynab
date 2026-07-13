@@ -872,6 +872,18 @@ class App extends React.Component {
   // degli ultimi 3 mesi completi, il totale accumulato fino allo STESSO giorno del
   // mese di oggi (es. se oggi è il 13, quanto era stato speso entro il giorno 13 in
   // ciascuno dei 3 mesi precedenti), poi ne facciamo la media.
+  // Media semplice degli ultimi n mesi COMPLETI (nessun troncamento al giorno): usata
+  // ora che questa media non deve più essere confrontata nella stessa card col mese
+  // corrente parziale — quello è mostrato a parte, in tempo reale.
+  avgFullMonths(type, n, accId){
+    const curMo = this.today().slice(0,7);
+    let sum=0;
+    for(let i=1; i<=n; i++){
+      const mo = this.addMonth(curMo, -i);
+      this.state.transactions.forEach(t=>{ if(t.type===type && (t.date||'').slice(0,7)===mo && (!accId || t.accountId===accId)) sum += this.parseNum(t.amount); });
+    }
+    return sum/n;
+  }
   paceAdjustedAvg(type, accId){
     const todayIso = this.today();
     const dayNum = parseInt(todayIso.slice(8,10),10);
@@ -1318,17 +1330,17 @@ class App extends React.Component {
     const aom = this.ageOfMoney(dMonths, dAcc);
     const curIncome = this.curMonthToDate('Income', dAcc);
     const curExpense = this.curMonthToDate('Expense', dAcc);
-    const curNet = curIncome - curExpense;
-    const avgIncome3 = this.paceAdjustedAvg('Income', dAcc);
-    const avgExpense3 = this.paceAdjustedAvg('Expense', dAcc);
+    const avgIncome3 = this.avgFullMonths('Income', 3, dAcc);
+    const avgExpense3 = this.avgFullMonths('Expense', 3, dAcc);
     const avgNet3 = avgIncome3 - avgExpense3;
     const readyNow = this.readyToAssignNow();
     const kpis = [
-      { label:'Entrate', value:this.fmtEur(curIncome), sub:'media 3M '+this.fmtEur(avgIncome3), valColor:P.green },
-      { label:'Uscite', value:this.fmtEur(curExpense), sub:'media 3M '+this.fmtEur(avgExpense3), valColor:P.red },
-      { label:'Risparmio netto', value:this.fmtEur(curNet), sub:'media 3M '+this.fmtEur(avgNet3), valColor: curNet>=0?P.green:P.red },
+      { label:'Entrate (media 3 mesi prec.)', value:this.fmtEur(avgIncome3), sub:'ultimi 3 mesi completi', valColor:P.green },
+      { label:'Uscite (media 3 mesi prec.)', value:this.fmtEur(avgExpense3), sub:'ultimi 3 mesi completi', valColor:P.red },
+      { label:'Risparmio netto (media)', value:this.fmtEur(avgNet3), sub:'ultimi 3 mesi completi', valColor: avgNet3>=0?P.green:P.red },
       { label:'Da assegnare', value:this.mask(this.fmtEur(readyNow)), sub: readyNow<-0.005?'sforato questo mese':'mese corrente', valColor: readyNow<-0.005?P.red:(readyNow>0.005?P.green:P.text) },
-      { label:'Età del denaro', value: aom==null?'—':(aom+' gg'), sub:'copertura spese', valColor:'#8b7cf6' },
+      { label:'Entrate mese', value:this.fmtEur(curIncome), sub:'in tempo reale, finora', valColor:P.green },
+      { label:'Uscite mese', value:this.fmtEur(curExpense), sub:'in tempo reale, finora', valColor:P.red },
     ].map(k => Object.assign({}, k, { valStyle:{ fontFamily:"'JetBrains Mono',monospace", fontWeight:600, fontSize:'21px', marginTop:'6px', color:k.valColor } }));
 
     // -- Sottopagine Dashboard (una per ogni KPI/report, navigabili dal menu laterale) --
@@ -1579,6 +1591,7 @@ class App extends React.Component {
     const worstMonth = savRates.length ? savRates.reduce((a,b)=> b.net<a.net?b:a) : null;
     const avgSavingsRate = savRates.length ? Math.round(savRates.reduce((s,r)=>s+r.rate,0)/savRates.length) : 0;
     const savSummary = [
+      { label:'Età del denaro', value: aom==null?'—':(aom+' giorni'), color:'#8b7cf6' },
       { label:'Tasso medio di risparmio', value: avgSavingsRate+'%', color: avgSavingsRate>=0?P.green:P.red },
       { label:'Mese migliore', value: bestMonth ? (this.monthAbbr(bestMonth.mo)+' · '+this.fmtEur(bestMonth.net)) : '—', color:P.green },
       { label:'Mese peggiore', value: worstMonth ? (this.monthAbbr(worstMonth.mo)+' · '+this.fmtEur(worstMonth.net)) : '—', color:P.red },
