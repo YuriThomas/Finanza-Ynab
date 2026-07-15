@@ -893,11 +893,19 @@ class App extends React.Component {
     this.state.transactions.forEach(t=>{ if(t.type===type && (t.date||'').slice(0,7)===curMo && (t.date||'')<=todayIso && (!accId || t.accountId===accId)) sum += this.parseNum(t.amount); });
     return sum;
   }
-  // "Pronto per assegnare" riferito sempre al mese corrente (oggi), indipendente dal
-  // mese eventualmente aperto nella pagina Budget e dal filtro conto della Dashboard:
-  // è un concetto di budget complessivo, non filtrabile per singolo conto.
+  // Il "Pronto per assegnare" deve essere un UNICO valore, sempre lo stesso qualunque
+  // mese tu stia guardando nel Budget: una volta assegnati dei soldi in un mese
+  // qualsiasi (anche futuro), quei soldi sono impegnati e basta — non devono ricomparire
+  // come liberi se torni a guardare un mese precedente. Per questo lo calcoliamo sempre
+  // usando il mese più avanzato tra "oggi" e l'ultimo mese in cui esiste un'assegnazione,
+  // MAI usando il mese che l'utente sta semplicemente sfogliando nella UI.
+  latestBudgetMonth(){
+    let latest = this.today().slice(0,7);
+    this.state.budgets.forEach(b=>{ if(b.month && b.month > latest) latest = b.month; });
+    return latest;
+  }
   readyToAssignNow(){
-    const month = this.today().slice(0,7);
+    const month = this.latestBudgetMonth();
     const catList = this.state.categories.filter(c=>c.type==='Expense' && !c.hidden);
     const totalAvail = catList.reduce((s,c)=>s+this.catAvail(c.id, month), 0);
     return this.onBudgetCash() - totalAvail;
@@ -1262,16 +1270,21 @@ class App extends React.Component {
       return { name: g||'Senza gruppo', rows, assignedText:this.fmtEur(gAssigned), spentText:this.fmtEur(gSpent), availText:this.fmtEur(gAvail), availStyle:{ fontFamily:"'JetBrains Mono',monospace", fontWeight:600, fontSize:'11.5px', color:gAvailColor }, isEmpty: rows.length===0, collapsed, onToggleCollapse:()=>this.toggleGroupCollapse(g), chevronStyle:{ width:'14px', height:'14px', flexShrink:'0', transition:'transform .15s', transform: collapsed?'rotate(-90deg)':'rotate(0deg)', cursor:'pointer', color:C.t2 } };
     }).filter(gr => !(gr.isEmpty && gr.name==='Senza gruppo'));
     // Pronto per assegnare = liquidità nei conti di budget − tutto ciò che risulta
-    // ancora "disponibile" nelle categorie in questo mese, riporto incluso.
-    // Il "disponibile" di categoria (carry + assegnato − speso) include già il
-    // riporto dei saldi positivi dai mesi precedenti: quei soldi restano "vincolati"
-    // alla categoria (es. Fondo casa 18.000€ a luglio, pur con assegnato 0 a luglio)
-    // e NON devono ricomparire come liquidità pronta da assegnare. Un eventuale
-    // sforamento (disponibile negativo) di un mese passato non si riporta più nella
-    // categoria (si chiude, catCarryover lo azzera) ma resta comunque sottratto qui,
-    // perché la spesa reale ha già ridotto la liquidità nei conti.
-    // Invariante: Pronto per assegnare + Σ disponibile di tutte le categorie = liquidità reale.
-    const ready = this.onBudgetCash() - totalAvail;
+    // ancora "disponibile" nelle categorie, riporto incluso — calcolato SEMPRE sul
+    // mese globale più avanzato (oggi, o l'ultimo mese con un'assegnazione se più
+    // avanti), MAI sul mese che stai sfogliando qui sotto. Così, se assegni dei soldi
+    // ad agosto e poi torni a guardare luglio, il valore resta lo stesso: quei soldi
+    // sono già impegnati e non ricompaiono come liberi solo perché guardi un mese
+    // precedente. Il "disponibile" di categoria (carry + assegnato − speso) include
+    // già il riporto dei saldi positivi dai mesi precedenti: quei soldi restano
+    // "vincolati" alla categoria e NON devono ricomparire come liquidità pronta da
+    // assegnare. Un eventuale sforamento (disponibile negativo) di un mese passato
+    // non si riporta più nella categoria (si chiude, catCarryover lo azzera) ma resta
+    // comunque sottratto qui, perché la spesa reale ha già ridotto la liquidità nei conti.
+    // Invariante: Pronto per assegnare + Σ disponibile di tutte le categorie (mese globale) = liquidità reale.
+    const globalReadyMonth = this.latestBudgetMonth();
+    const globalTotalAvail = expenseCatList.reduce((s,c)=>s+this.catAvail(c.id, globalReadyMonth), 0);
+    const ready = this.onBudgetCash() - globalTotalAvail;
     const readyPositive = ready >= -0.005;
     const readyWarning = !readyPositive;
     const readyZero = Math.abs(ready) < 0.005;
